@@ -1,28 +1,33 @@
 """
 risk_engine.py — Scam intent risk scorer for DeepTrust.
 
-Combines two signals to produce a final risk score:
-  1. Intent score   — keyword matching against known scam phrases (70% weight)
-  2. Trust score    — neural audio authenticity from wav2vec2   (30% weight)
+Combines three signals to produce a final risk score:
+  1. Semantic Intent — DistilBERT NLP classification (50% weight)
+  2. Keyword Intent  — multilingual keyword matches      (20% weight)
+  3. Authenticity   — neural audio trust score            (30% weight)
 
-Intent Scoring:
+1. Semantic Score Mapping:
+  - "scam or fraud attempt" → confidence * 100
+  - "suspicious conversation" → confidence * 60
+  - "normal conversation" → confidence * 20
+
+2. Keyword Scoring:
   - Base risk = 0
   - +15 per keyword match (case-insensitive substring search)
-  - +5 if transcript is longer than 50 words
   - Capped at 100
 
-Combined Formula:
-  final_risk = intent_score * 0.7 + (100 - trust_score) * 0.3
+3. Authenticity Score:
+  - Trust score (0–100) from wav2vec2 model
+  - Risk factor = (100 - trust_score)
+
+Final Risk Aggregation:
+  final_risk = (semantic_score * 0.5) + (keyword_score * 0.2) + ((100 - trust_score) * 0.3)
   Capped at 100
 
 Risk levels:
   0–30  → "safe"
   31–60 → "suspicious"
   61–100 → "high"
-
-Future extensibility:
-  - Sentiment analysis or urgency-tone detection could add additional signal.
-  - The weights (0.7 / 0.3) could be tuned based on labelled data.
 """
 
 import json
@@ -47,26 +52,17 @@ except (json.JSONDecodeError, KeyError) as e:
 
 # ── Scoring constants ───────────────────────────────────────────────────────
 KEYWORD_WEIGHT = 15          # Points per keyword match
-LONG_TRANSCRIPT_BONUS = 5    # Extra points if transcript exceeds word threshold
-WORD_COUNT_THRESHOLD = 50    # Word count that triggers the bonus
 MAX_SCORE = 100              # Hard cap
 
-# Weights for combining intent and authenticity scores
-INTENT_WEIGHT = 0.7
+# Weights for final risk aggregation
+SEMANTIC_WEIGHT = 0.5
+KEYWORD_ONLY_WEIGHT = 0.2
 AUTHENTICITY_WEIGHT = 0.3
 
 
-def calculate_intent_score(transcript: str) -> dict:
+def calculate_keyword_score(transcript: str) -> dict:
     """
-    Compute intent-only risk score from keyword matching.
-
-    Returns
-    -------
-    dict
-        {
-            "score": int,
-            "matched_keywords": list[str]
-        }
+    Compute keyword-only intent score.
     """
     if not transcript or not transcript.strip():
         return {"score": 0, "matched_keywords": []}
@@ -74,80 +70,69 @@ def calculate_intent_score(transcript: str) -> dict:
     transcript_lower = transcript.lower()
     matched: list[str] = []
 
-    # ── Keyword matching (case-insensitive substring) ───────────────────
     for keyword in _KEYWORDS:
         if keyword.lower() in transcript_lower:
             matched.append(keyword)
 
-    # ── Calculate score ─────────────────────────────────────────────────
-    score = len(matched) * KEYWORD_WEIGHT
-
-    # Bonus for long transcripts (longer calls give scammers more room)
-    word_count = len(transcript.split())
-    if word_count > WORD_COUNT_THRESHOLD:
-        score += LONG_TRANSCRIPT_BONUS
-
-    # Hard cap
-    score = min(score, MAX_SCORE)
-
+    score = min(len(matched) * KEYWORD_WEIGHT, MAX_SCORE)
     return {"score": score, "matched_keywords": matched}
 
 
-def calculate_risk(transcript: str, trust_score: int = -1) -> dict:
+def calculate_semantic_score(intent: str, confidence: float) -> int:
     """
-    Analyse a transcript and return a combined risk score + level.
+    Map transformer intent classification to 0–100 score.
+    """
+    if intent == "scam or fraud attempt":
+        return int(confidence * 100)
+    elif intent == "suspicious conversation":
+        return int(confidence * 60)
+    elif intent == "normal conversation":
+        return int(confidence * 20)
+    return 0
 
-    When a valid trust_score (0–100) is provided from the authenticity model,
-    the final risk is a weighted blend of intent and authenticity signals:
-        final_risk = intent_score * 0.7 + (100 - trust_score) * 0.3
 
-    When trust_score is -1 (model unavailable), falls back to intent-only scoring.
+def calculate_risk(
+    transcript: str, 
+    semantic_intent: str = "unknown", 
+    semantic_confidence: float = 0.0,
+    trust_score: int = -1
+) -> dict:
+    """
+    Analyse transcript and authenticity to return a final aggregated risk score.
 
-    Parameters
-    ----------
-    transcript : str
-        The speech-to-text output from the audio file.
-    trust_score : int
-        Authenticity trust score (0–100). -1 means model unavailable.
-
-    Returns
-    -------
-    dict
-        {
-            "score": int,               # 0–100  (final combined risk)
-            "intent_score": int,        # 0–100  (keyword-only risk)
-            "level": str,               # "safe" | "suspicious" | "high"
-            "matched_keywords": list[str]
-        }
+    Aggregation logic:
+      final_risk = (semantic_score * 0.5) + (keyword_score * 0.2) + ((100 - trust_score) * 0.3)
     """
     if not transcript or not transcript.strip():
         return {
             "score": 0,
-            "intent_score": 0,
             "level": "safe",
-            "matched_keywords": [],
+            "semantic_score": 0,
+            "keyword_score": 0,
+            "matched_keywords": []
         }
 
-    # ── Step 1: Intent scoring ──────────────────────────────────────────
-    intent = calculate_intent_score(transcript)
-    intent_score = intent["score"]
+    # 1. Keyword scoring
+    kw_result = calculate_keyword_score(transcript)
+    keyword_score = kw_result["score"]
 
-    # ── Step 2: Combine with authenticity if available ───────────────────
-    if trust_score >= 0:
-        # Higher trust_score means more human → lower risk contribution
-        # Lower trust_score means more synthetic → higher risk contribution
-        final_score = int(
-            intent_score * INTENT_WEIGHT
-            + (100 - trust_score) * AUTHENTICITY_WEIGHT
-        )
-    else:
-        # Fallback: intent-only scoring when authenticity model unavailable
-        final_score = intent_score
+    # 2. Semantic scoring from transformer result
+    semantic_score = calculate_semantic_score(semantic_intent, semantic_confidence)
+
+    # 3. Base authenticity risk (fallback to 0 if model unavailable)
+    auth_risk = (100 - trust_score) if trust_score >= 0 else 0
+
+    # 4. Aggregation
+    final_score = int(
+        (semantic_score * SEMANTIC_WEIGHT) +
+        (keyword_score * KEYWORD_ONLY_WEIGHT) +
+        (auth_risk * AUTHENTICITY_WEIGHT)
+    )
 
     # Hard cap
     final_score = min(final_score, MAX_SCORE)
 
-    # ── Step 3: Determine risk level ────────────────────────────────────
+    # Determine risk level
     if final_score <= 30:
         level = "safe"
     elif final_score <= 60:
@@ -156,13 +141,14 @@ def calculate_risk(transcript: str, trust_score: int = -1) -> dict:
         level = "high"
 
     logger.info(
-        "Risk analysis: intent=%d, trust=%d, final=%d, level=%s, matched=%s",
-        intent_score, trust_score, final_score, level, intent["matched_keywords"],
+        "Risk aggregation: semantic=%d, keyword=%d, trust=%d, final=%d, level=%s",
+        semantic_score, keyword_score, trust_score, final_score, level
     )
 
     return {
         "score": final_score,
-        "intent_score": intent_score,
         "level": level,
-        "matched_keywords": intent["matched_keywords"],
+        "semantic_score": semantic_score,
+        "keyword_score": keyword_score,
+        "matched_keywords": kw_result["matched_keywords"]
     }
