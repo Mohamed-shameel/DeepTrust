@@ -1,0 +1,7 @@
+{
+  "name": "DeepTrust ",
+  "description": "Real-time deepfake scam detection for calls using privacy-first edge AI.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
